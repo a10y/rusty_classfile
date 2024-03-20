@@ -2,6 +2,10 @@
 name = "classfile"
 version = "0.1.0"
 edition = "2021"
+publish = false
+authors = [
+    "Andrew Duffy <andrew@a10y.dev>"
+]
 
 [dependencies]
 bytes = "1"
