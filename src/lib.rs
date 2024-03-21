@@ -1,6 +1,9 @@
 use std::io::{BufRead, BufReader, Read};
 use std::string::FromUtf8Error;
 
+#[macro_use]
+pub(crate) mod macros;
+
 ///! `classfile` is a library providing read-only access to a JVM ClassFile structure.
 ///
 
@@ -12,11 +15,25 @@ pub struct ClassFileVersion(
     /* Minor */ u16);
 
 
-pub const CP_TAG_UTF8: u8 = 1;
-pub const CP_TAG_INTEGER: u8 = 3;
-pub const CP_TAG_FLOAT: u8 = 4;
-pub const CP_TAG_LONG: u8 = 5;
-pub const CP_TAG_DOUBLE: u8 = 6;
+reversible_enum! {
+    ConstantPoolItemTag as u8,
+    {
+        Utf8 = 1,
+        Integer = 3,
+        Float = 4,
+        Long = 5,
+        Double = 6,
+        Class = 7,
+        String = 8,
+        FieldRef = 9,
+        MethodRef = 10,
+        InterfaceMethodRef = 11,
+        NameAndType = 12,
+        MethodHandle = 15,
+        MethodType = 16,
+        InvokeDynamic = 18,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConstantPoolItem {
@@ -26,6 +43,15 @@ pub enum ConstantPoolItem {
     Long(i64),
     Double(f64),
     Unsupported,
+}
+
+impl ConstantPoolItem {
+    pub fn is_8byte(&self) -> bool {
+        match &self {
+            ConstantPoolItem::Long(_) | ConstantPoolItem::Double(_) => true,
+            _ => false
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +70,9 @@ pub enum Error {
 
     #[error("Invalid magic in file header: {0:?}")]
     InvalidMagic([u8; 4]),
+
+    #[error("Invalid constant_pool_item tag: {0}")]
+    InvalidConstantPoolItemTag(u8),
 }
 
 trait ReadExt: Read {
@@ -54,15 +83,6 @@ trait ReadExt: Read {
     fn read_i64(&mut self) -> Result<i64, std::io::Error>;
     fn read_f32(&mut self) -> Result<f32, std::io::Error>;
     fn read_f64(&mut self) -> Result<f64, std::io::Error>;
-}
-
-macro_rules! read_bytes {
-    ($self:expr, $ty:ty, $N:expr) => {{
-        let mut buf = [0u8; $N];
-        $self.read_exact(&mut buf)?;
-
-        Ok(<$ty>::from_be_bytes(buf))
-    }};
 }
 
 impl<R> ReadExt for R where R: Read {
@@ -109,12 +129,35 @@ pub fn read_from<R>(reader: R) -> Result<ClassFile, Error>
     let minor = buf_read.read_u16()?;
     let major = buf_read.read_u16()?;
 
-    let constant_pool_count = buf_read.read_u16()?;
+    // NOTE: For some reason the JVM stores this as N+1, and uses 1-based indexing for items.
+    let constant_pool_count = buf_read.read_u16()? - 1;
     let mut constant_pool_items = Vec::new();
+    println!("count = {constant_pool_count}");
 
-    for _ in 0..constant_pool_count {
-        constant_pool_items.push(read_constant_pool_item(&mut buf_read)?);
+    {
+        let mut constant_pool_index = 0;
+        loop {
+            if constant_pool_index >= constant_pool_count {
+                break;
+            }
+
+            let item = read_constant_pool_item(&mut buf_read)?;
+            // JVM oddity: 64-bit types occupy 2 slots in the constant pool.
+            if item.is_8byte() {
+                constant_pool_index += 2
+            } else {
+                constant_pool_index += 1
+            }
+
+            constant_pool_items.push(item);
+        }
     }
+
+    let access_flags = buf_read.read_u16()?;
+    let this_class = buf_read.read_u16()?;
+    let super_class = buf_read.read_u16()?;
+    let interfaces_count = buf_read.read_u16()?;
+    // Read a bunch of interfaces.
 
     Ok(ClassFile {
         version: ClassFileVersion(major, minor),
@@ -126,27 +169,79 @@ pub fn read_constant_pool_item<R>(mut buf_read: R) -> Result<ConstantPoolItem, E
     where R: BufRead,
 {
     let type_tag = buf_read.read_u8()?;
+    let type_tag = ConstantPoolItemTag::try_from(type_tag)?;
     match type_tag {
-        CP_TAG_UTF8 => {
+        ConstantPoolItemTag::Utf8 => {
             let strlen = buf_read.read_u16()?;
             let mut utf8_bytes = vec![0; strlen as usize];
             buf_read.read_exact(&mut utf8_bytes)?;
 
             Ok(ConstantPoolItem::Utf8(String::from_utf8(utf8_bytes)?))
         }
-        CP_TAG_INTEGER => {
+        ConstantPoolItemTag::Integer => {
             Ok(ConstantPoolItem::Integer(buf_read.read_i32()?))
         }
-        CP_TAG_FLOAT => {
+        ConstantPoolItemTag::Float => {
             Ok(ConstantPoolItem::Float(buf_read.read_f32()?))
         }
-        CP_TAG_LONG => {
+        ConstantPoolItemTag::Long => {
             Ok(ConstantPoolItem::Long(buf_read.read_i64()?))
         }
-        CP_TAG_DOUBLE => {
+        ConstantPoolItemTag::Double => {
             Ok(ConstantPoolItem::Double(buf_read.read_f64()?))
         }
-        _ => Ok(ConstantPoolItem::Unsupported)
+        ConstantPoolItemTag::Class => {
+            // TODO(aduffy): handle CONSTANT_Class_info
+            let _index = buf_read.read_u16()?;
+
+            Ok(ConstantPoolItem::Unsupported)
+        }
+        ConstantPoolItemTag::String => {
+            // TODO(aduffy): handle CONSTANT_String_info
+            let _string_index = buf_read.read_u16()?;
+            Ok(ConstantPoolItem::Unsupported)
+        }
+        ConstantPoolItemTag::FieldRef => {
+            // TODO(aduffy): handle CONSTANT_Fieldref_info
+            let _class_index = buf_read.read_u16()?;
+            let _name_and_type_index = buf_read.read_u16()?;
+            Ok(ConstantPoolItem::Unsupported)
+        }
+        ConstantPoolItemTag::MethodRef => {
+            // TODO(aduffy): handle CONSTANT_Methodref_info
+            let _class_index = buf_read.read_u16()?;
+            let _name_and_type_index = buf_read.read_u16()?;
+            Ok(ConstantPoolItem::Unsupported)
+        }
+        ConstantPoolItemTag::InterfaceMethodRef => {
+            // TODO(aduffy): handle CONSTANT_InterfaceMethodref_info
+            let _class_index = buf_read.read_u16()?;
+            let _name_and_type_index = buf_read.read_u16()?;
+            Ok(ConstantPoolItem::Unsupported)
+        }
+        ConstantPoolItemTag::NameAndType => {
+            // TODO(aduffy): handle CONSTANT_NameAndType_info
+            let _name_index = buf_read.read_u16()?;
+            let _descriptor_index = buf_read.read_u16()?;
+            Ok(ConstantPoolItem::Unsupported)
+        }
+        ConstantPoolItemTag::MethodHandle => {
+            // TODO(aduffy): handle CONSTANT_MethodHandle_info
+            let _reference_kind = buf_read.read_u8()?;
+            let _reference_index = buf_read.read_u16()?;
+            Ok(ConstantPoolItem::Unsupported)
+        }
+        ConstantPoolItemTag::MethodType => {
+            // TODO(aduffy): handle CONSTANT_MethodType_info
+            let _descriptor_index = buf_read.read_u16()?;
+            Ok(ConstantPoolItem::Unsupported)
+        }
+        ConstantPoolItemTag::InvokeDynamic => {
+            // TODO(aduffy): handle CONSTANT_InvokeDynamic_info
+            let _bootstrap_method_attr_index = buf_read.read_u16()?;
+            let _name_and_type_index = buf_read.read_u16()?;
+            Ok(ConstantPoolItem::Unsupported)
+        }
     }
 }
 
@@ -168,11 +263,11 @@ mod test {
 
     #[test]
     fn test_valid_magic() {
-        let bytes_reader = Bytes::from_static(&[0xCA, 0xFE, 0xBA, 0xBE, 0u8, 10u8, 0u8, 10u8]);
+        let bytes_reader = Bytes::from_static(&[0xCA, 0xFE, 0xBA, 0xBE, 0u8, 10u8, 0u8, 10u8, 0u8, 0u8]);
         let result = read_from(bytes_reader.reader());
         assert_eq!(result.unwrap(), ClassFile {
             version: ClassFileVersion(10, 10),
-            constant_pool: ConstantPool,
+            constant_pool: Vec::new(),
         })
     }
 
@@ -191,13 +286,13 @@ mod test {
 
             assert_eq!(class_file, ClassFile {
                 version: ClassFileVersion(10, 10),
-                constant_pool: ConstantPool,
+                constant_pool: Vec::new(),
             });
         });
 
         let client = std::thread::spawn(move || {
             let mut socket = TcpStream::connect(addr.clone()).unwrap();
-            socket.write_all(&[0xCA, 0xFE, 0xBA, 0xBE, 0u8, 10u8, 0u8, 10u8]).unwrap();
+            socket.write_all(&[0xCA, 0xFE, 0xBA, 0xBE, 0u8, 10u8, 0u8, 10u8, 0u8, 0u8]).unwrap();
         });
 
         client.join().unwrap();
